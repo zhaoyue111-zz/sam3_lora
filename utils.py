@@ -7,6 +7,8 @@ from transformers import Sam3Model, Sam3Processor
 from dataset import SourceDataset, split_train_val
 from torch.nn import DataParallel
 import torch.nn.functional as F
+from loss import sigmoid_focal_loss, dice_loss
+
 
 def load_model():
     path = "/home/data4/zy/weight/sam3"
@@ -14,8 +16,8 @@ def load_model():
     processor = Sam3Processor.from_pretrained(path)
 
     lora_config = LoraConfig(
-        r=12,
-        lora_alpha=24,
+        r=14,
+        lora_alpha=28,
         target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
         lora_dropout=0.05,
         bias="none",
@@ -31,7 +33,7 @@ def load_model():
             param.requires_grad = False
         if 'vision_encoder.backbone.layers' in name:
             layer_num = int(name.split('layers.')[1].split('.')[0])
-            if layer_num < 16:  #  冻结前 16 层，只训练后 16 层
+            if layer_num < 16:
                 param.requires_grad = False
 
     trainable = sum(p.numel() for p in lora_model.parameters() if p.requires_grad)
@@ -56,7 +58,6 @@ def load_data(processor):
 
 
 def save_checkpoint(lora_model, optimizer, epoch, save_path):
-    # 如果使用 DataParallel，需要获取底层模型
     model_to_save = lora_model.module if isinstance(lora_model, DataParallel) else lora_model
 
     torch.save({
@@ -67,82 +68,72 @@ def save_checkpoint(lora_model, optimizer, epoch, save_path):
     print(f"检查点已保存: {save_path}")
 
 
-def post_process_batch_outputs(outputs, target_sizes, device, threshold=0.5, mask_threshold=0.5):
-    """
-    参考Sam3ImageProcessorFast.post_process_instance_segmentation实现
-    返回：
-    - pred_logits: 融合后的 logits [B, 1, H', W']
-    - pred_masks: sigmoid后的[B, 1, H', W']
-    """
-    pred_masks_logits = outputs.pred_masks  # [B, num_queries, H, W]
-    pred_logits = outputs.pred_logits  # [B, num_queries]
-    presence_logits = outputs.presence_logits # [B, 1] or None
-    batch_size = pred_logits.shape[0]
+def process_outputs(outputs, target, threshold=0.3,weight_dice=0.5,mode="train"):
+    '''
+    outputs
+    target: [B,1,H,W]
+    '''
+    pred_logits = outputs.pred_logits  # [B, N]
+    pred_masks = outputs.pred_masks  # [B, N, H', W']
 
-    batch_logits = []
-    batch_masks = []
+    batch_losses_focal = []
+    batch_losses_dice = []
+    batch_preds = []
 
-    for b in range(batch_size):
-        scores = pred_logits[b].float().sigmoid()  # [num_queries]
-        if presence_logits is not None:
-            presence_score = presence_logits[b].float().sigmoid()  # [1]
-            scores = scores * presence_score  # Broadcast: [num_queries] * [1] = [num_queries]
+    B, C, H, W = target.shape
 
-        masks_logits = pred_masks_logits[b]  # [num_queries, H, W]
+    for b in range(B):
+        pred_logits_b = pred_logits[b]  # [N]
+        pred_masks_b = pred_masks[b]  # [N, H', W']
+        pred_probs = torch.sigmoid(pred_logits_b)  # [N]
 
-        #  阈值筛选（对应源码中的 keep = scores > threshold）
-        keep = scores > threshold
-        if keep.sum() == 0:
-            # 没有 score > threshold，直接返回全 0 logits（不经过索引操作）
-            h, w = target_sizes[b]
-            combined_logits = torch.zeros((h, w), device=masks_logits.device, requires_grad=True)
-        else:
-            # 有有效 score，正常加权平均
-            valid_scores = scores[keep]  # [num_keep]
-            valid_masks_logits = masks_logits[keep]  # [num_keep, H, W]
-            target_size = tuple(target_sizes[b])
-            logits_resized = F.interpolate(
-                valid_masks_logits.unsqueeze(0),
-                size=target_size,
+        weight = pred_probs.clamp(min=threshold, max=1.0)
+        weight = weight / (weight.sum() + 1e-8)
+        pred_mask = (pred_masks_b * weight.view(-1, 1, 1)).sum(dim=0)  # [H', W']
+
+        if pred_mask.shape[-2:] != (H, W):
+            pred_mask = F.interpolate(
+                pred_mask.unsqueeze(0).unsqueeze(0),  # [1, 1, H', W']
+                size=(H, W),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(0)
+            ).squeeze(0).squeeze(0)  # [H, W]
 
-            scores_sum = valid_scores.sum()
+        target_mask = target[b, 0, :, :]  # [H, W]
+        # print(f"[process] target_masks==1: {(target_mask==1.0).sum()}")
+        pred_flat = pred_mask.view(-1)  # [H*W]
+        target_flat = target_mask.view(-1)  # [H*W]
 
-            print(f"scores_sum: {scores_sum}")
-            if scores_sum > 1e-8:
-                combined_logits = (logits_resized * valid_scores.view(-1, 1, 1)).sum(dim=0) / scores_sum
-            else:
-                # scores_sum 接近 0，返回全 0
-                h, w = target_sizes[b]
-                combined_logits = torch.zeros((h, w), device=masks_logits.device, requires_grad=True)
+        loss_focal_b = sigmoid_focal_loss(pred_flat, target_flat, num_boxes=1.0)
+        loss_dice_b = dice_loss(pred_flat, target_flat, num_boxes=1.0)
 
-        batch_logits.append(combined_logits.unsqueeze(0))
-        batch_masks.append(combined_logits.sigmoid().unsqueeze(0))
+        batch_losses_focal.append(loss_focal_b)
+        batch_losses_dice.append(loss_dice_b)
+        batch_preds.append(pred_mask)  # [H, W]
 
-    pred_logits = torch.stack(batch_logits, dim=0)  # [B, 1, H, W]
-    pred_masks = torch.stack(batch_masks, dim=0)  # [B, 1, H, W]
+    loss_focal = sum(batch_losses_focal) / B
+    loss_dice = sum(batch_losses_dice) / B
+    loss = loss_focal + weight_dice * loss_dice
 
-    pred_logits = pred_logits.to(device)
-    pred_masks = pred_masks.to(device)
+    if mode == "test":
+        return loss, loss_focal, loss_dice, batch_preds
+    else:
+        return loss, loss_focal, loss_dice
 
-    assert pred_logits.requires_grad, "pred_logits_combined 没有梯度"
-
-    return pred_logits, pred_masks
-
-
-def compute_metrics(pred, target,smooth=1e-6):
+def compute_metrics(pred, target, smooth=1e-6):
     '''
-        pred: tensor [B,1,H,W] 只有01
-        target: tensor [B,1,H,W]  只有01
+    pred: tensor [B, H, W] logits值（NOT sigmoid后）
+    target: tensor [B, H, W] 01的GT
     '''
-    pred = (pred>0.5).float()
+    pred = torch.sigmoid(pred).detach()
     target = target.float()
+
+    pred= (pred > 0.5).float()
 
     intersection = (pred * target).sum()
     union = pred.sum() + target.sum()
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-    iou=intersection / union if union > 0 else 1.0
 
-    return iou,dice
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    iou = intersection / (union - intersection + smooth)
+
+    return iou.item(), dice.item()
