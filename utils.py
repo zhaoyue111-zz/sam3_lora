@@ -20,8 +20,7 @@ def load_model():
         lora_alpha=28,
         target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
         lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.FEATURE_EXTRACTION
+        bias="none"
     )
     lora_model = get_peft_model(base_model, lora_config)
 
@@ -47,12 +46,13 @@ def load_data(processor):
     df = pd.read_excel("/home/data4/zy/data/CT_MRI_DATA/MRI_mapping_info_labeled.csv")
     image_root = "/home/data4/zy/data/CT_MRI_DATA/images/Delay/pngs"
     mask_root = "/home/data4/zy/data/CT_MRI_DATA/labels/Delay/pngs"
-    train_uids, val_uids = split_train_val(df, train_ratio=0.8, subset=0)
 
-    train_dataset = SourceDataset(df, image_root, mask_root, processor, subset=0, uids=train_uids)
-    val_dataset = SourceDataset(df, image_root, mask_root, processor, subset=0, uids=val_uids)
+    train_dataset = SourceDataset(df, image_root, mask_root, processor, subset=0)
+    val_dataset = SourceDataset(df, image_root, mask_root, processor, subset=1)
     train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
     val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
+    print("train size: ",len(train_dataset))
+    print("valid size: ",len(val_dataset))
 
     return train_dataloader, val_dataloader
 
