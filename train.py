@@ -8,7 +8,6 @@ from utils import load_model, load_data, save_checkpoint, compute_metrics, proce
 
 torch.cuda.empty_cache()
 
-
 def train_epoch(lora_model, train_dataloader, optimizer, scaler, epoch, num_epochs, writer, device):
     lora_model.train()
     epoch_loss = 0.0
@@ -73,7 +72,8 @@ def valid_epoch(lora_model, val_dataloader, epoch, writer, device):
             grid_gt = torchvision.utils.make_grid(gts_vis.unsqueeze(1), normalize=False)
 
             writer.add_image(f"Val/Pred_epoch{epoch + 1}_batch{batch_idx}", grid_pred, epoch)
-            writer.add_image(f"Val/GT_epoch{epoch + 1}_batch{batch_idx}", grid_gt, epoch)
+            if epoch==0:
+                writer.add_image(f"Val/GT_epoch{epoch + 1}_batch{batch_idx}", grid_gt, epoch)
 
     avg_val_loss = val_loss / len(val_dataloader)
     avg_val_dice = val_dice / len(val_dataloader)
