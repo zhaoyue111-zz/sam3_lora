@@ -24,7 +24,7 @@ def dice_loss(inputs, targets, num_boxes=1.0, smooth=1e-6):
     inputs: logits [H*W]
     targets: [H*W]
     """
-    inputs = inputs.float()
+    inputs = torch.sigmoid(inputs).float()
     targets = targets.float()
 
     intersection = (inputs * targets).sum()
