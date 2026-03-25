@@ -22,20 +22,18 @@ def split_train_val(df, train_ratio=0.8, subset=0, seed=42):
     return train_uids, val_uids
 
 class SourceDataset(Dataset):
-    def __init__(self, df, image_root, mask_root, processor, text="liver", transform=None, subset=0,uids=None):
+    def __init__(self, df, image_root, mask_root, processor, text="liver", sequence="Delay",transform=None, subset=0):
         """
         df: 从Excel读取的DataFrame
         image_root: /home/data4/zy/data/CT_MRI_DATA/images/Delay/pngs
         mask_root: /home/data4/zy/data/CT_MRI_DATA/labels/Delay/pngs
-        subset: 0表示训练集，1表示测试集
+        subset: 0表示训练集，1表示验集集，2表示测试集
         """
         self.processor = processor
         self.transform = transform
         self.text = text
 
-        df_subset = df[(df["subset"] == subset) & (df["Delay"] == 1)]
-        if uids is not None:
-            df_subset=df_subset[df_subset["uid"].isin(uids)]
+        df_subset = df[(df["subset"] == subset) & (df[sequence] == 1)]
 
         self.image_paths = []
         self.mask_paths = []
@@ -78,27 +76,23 @@ class SourceDataset(Dataset):
         return inputs, target_mask
 
 if __name__ == '__main__':
-
     df = pd.read_excel("/home/data4/zy/data/CT_MRI_DATA/MRI_mapping_info_labeled.csv")
+    image_root = "/home/data4/zy/data/CT_MRI_DATA/images/Delay/pngs"
+    mask_root = "/home/data4/zy/data/CT_MRI_DATA/labels/Delay/pngs"
+    # train_uids, val_uids = split_train_val(df, train_ratio=0.8, subset=0)
+
     path = "/home/data4/zy/weight/sam3"
     processor = Sam3Processor.from_pretrained(path)
 
-    image_root = "/home/data4/zy/data/CT_MRI_DATA/images/Delay/pngs"
-    mask_root = "/home/data4/zy/data/CT_MRI_DATA/labels/Delay/pngs"
+    train_dataset = SourceDataset(df, image_root, mask_root, processor, subset=0)
+    val_dataset = SourceDataset(df, image_root, mask_root, processor, subset=1)
+    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
+    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
 
-    # inputs, target_mask=train_dataset[0]
+    for inputs, targets in train_dataloader:
+        for i in range(4):
+            print((targets[i]==0).sum(), (targets[i]==1).sum())
+        break
 
-    train_uids, val_uids = split_train_val(df, train_ratio=0.8, subset=0)
-
-    train_dataset = SourceDataset(df, image_root, mask_root, processor, subset=0, uids=train_uids)
-    val_dataset = SourceDataset(df, image_root, mask_root, processor, subset=0, uids=val_uids)
-    test_dataset = SourceDataset(df, image_root, mask_root, processor, subset=1)
-
-    print(f"训练集、验证集、测试集slices数分别为：{len(train_dataset)}, {len(val_dataset)}, {len(test_dataset)}")
-
-    train_dataloader=DataLoader(train_dataset,batch_size=4,shuffle=True)
-    for i,batch in enumerate(train_dataloader):
-        if i==0:
-            print(batch[0]['pixel_values'].shape) # [4,3,1008,1008]
-            print(batch[1].shape) # mask [4,1,256,256]
-            break
+    print(len(train_dataset))
+    print(len(val_dataset))
